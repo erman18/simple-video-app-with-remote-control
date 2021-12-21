@@ -1,0 +1,303 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <pic18.h>
+#include <proc/pic18f47k40.h>
+
+#define _XTAL_FREQ 16000000
+
+#define MDATA PORTDbits.RD0
+#define MCLK PORTDbits.RD1
+#define LOCKSTAT PORTAbits.RA6
+
+char mstat; //Mouse button status
+char mx; //X value read from mouse
+char my; //Y value read from mouse
+int xBuf = 0; //Buffer for x values
+int yBuf = 0; //Buffer for y values
+
+void OSC_init(void) {
+    OSCCON1bits.NOSC = 0b110; //Use High-Frequency Internal Oscillator
+    OSCCON1bits.NDIV = 0b0000; //Clock divider = 1
+    OSCCON2bits.COSC = 0b110; //Use High-Frequency Internal Oscillator
+    OSCCON2bits.CDIV = 0b0000; //Clock divider = 1
+    OSCFRQbits.HFFRQ = 0b0101; //Set frequency to 16 MHz
+}
+
+void USART1_init(void) {
+    TRISC = 0x80; //Pin 7 is input
+    TX1STAbits.TXEN = 1; //Enable transmit
+    TX1STAbits.BRGH = 1; //Enable high-speed
+    ANSELC = 0x00; //Set pins as digital
+    SP1BRGH = 0; //Baud rate = 9.6k
+    SP1BRGL = 0x68;
+    PIE3bits.RC1IE = 1; //Enable UART1 interrupt
+    RC1STAbits.SPEN = 1; //Enable serial port
+    RC1STAbits.CREN = 1; //Enable receiver
+    RC6PPS = 0x09; //Set pin C6 as EUSART1 TX
+}
+
+void USART1_TransmitChar(char out) {
+    while (PIR3bits.TX1IF == 0); //Wait until TX registers is ready
+    TX1REG = out; //Load and transmit TX registers
+}
+
+void USART1_TransmitString(char* out) {
+    while (*out) { //For all values in string
+        while (PIR3bits.TX1IF == 0); //Wait for TX to clear
+        TX1REG = *out++; //Transmit char
+    }
+    USART1_TransmitChar('\r'); //Return carriage
+    USART1_TransmitChar('\n'); //New line
+    USART1_TransmitChar('\0'); //Blank
+}
+
+void button_init() {
+    TRISA = 0xFF; //Set Port A as input
+    TRISAbits.TRISA6 = 0; //Set pin A6 as output
+    ANSELA = 0x00; //Set Port A as digital
+    PIE0bits.IOCIE = 1; //Enable interrupt on change
+    IOCAPbits.IOCAP0 = 1; //FF interrupt enable
+    IOCANbits.IOCAN0 = 1;
+    IOCAPbits.IOCAP1 = 1; //Pause interrupt enable
+    IOCANbits.IOCAN1 = 1;
+    IOCAPbits.IOCAP2 = 1; //RW interrupt enable
+    IOCANbits.IOCAN2 = 1;
+    IOCAPbits.IOCAP3 = 1; //ZI interrupt enable
+    IOCANbits.IOCAN3 = 1;
+    IOCAPbits.IOCAP4 = 1; //ZO interrupt enable
+    IOCANbits.IOCAN4 = 1;
+    IOCAPbits.IOCAP5 = 1; //Lock interrupt enable
+    IOCANbits.IOCAN5 = 1;
+}
+
+void gohi(int pin) {
+    if (pin == 0) { //Data pin
+        TRISDbits.TRISD0 = 1; //Set data as input
+        MDATA = 1; //Pull data high
+    }
+    if (pin == 1) { //Clock pin
+        TRISDbits.TRISD1 = 1; //Set clock as input
+        MCLK = 1; //Pull clock high
+    }
+}
+
+void golo(int pin) {
+    if (pin == 0) { //Data pin
+        TRISDbits.TRISD0 = 0; //Set data as output
+        MDATA = 0; //Pull data low
+    }
+    if (pin == 1) { //Clock pin
+        TRISDbits.TRISD1 = 0; //Set clock as output
+        MCLK = 0; //Pull clock low
+    }
+}
+
+void mouse_write(char data) {
+    gohi(0); //Set data as output
+    gohi(1); //Set clock as output
+    __delay_us(300); //Delay
+    golo(1); //Set clock low
+    __delay_us(300); //Delay
+    golo(0); //Set data low
+    __delay_us(10); //Delay
+    gohi(1); //Start bit
+    while (MCLK == 1); //Wait for mouse to take control
+    for (int i = 0; i < 8; i++) { //For all data bits
+        if (data & 0x01) { //If 1
+            gohi(0); //Set data high
+        } else { //If 0
+            golo(0); //Set data low
+        }
+        while (MCLK == 0); //Wait for clock cycle
+        while (MCLK == 1); //Wait for clock cycle
+        data = data >> 1; //Go to next bit
+    }
+    gohi(0); //Parity bit
+    while (MCLK == 0); //Wait for clock cycle
+    while (MCLK == 1); //Wait for clock cycle
+    gohi(0); //Stop bit
+    __delay_us(50); //Delay
+    while (MCLK == 1); //Wait
+    while ((MCLK == 0) || (MDATA == 0)); //Wait for mouse to switch modes
+    golo(1); //Put hold on incoming data
+}
+
+char mouse_read(void) {
+    char data = 0x00; //Initialize data variable
+    char theBit = 0x01; //Set index bit
+    gohi(1); //Set clock high
+    gohi(0); //Set data high
+    __delay_us(50); //Delay
+    while (MCLK == 1); //Wait for clock
+    __delay_us(5); //Delay
+    while (MCLK == 0); //Wait for clock
+    for (int i = 0; i < 8; i++) { //For all bits received
+        while (MCLK == 1); //Wait for clock
+        if (MDATA == 1) { //If bit is 1
+            data = data | theBit; //Adust data variable
+        }
+        while (MCLK == 0); //Wait for clock
+        theBit = theBit << 1; //Adjust index
+    }
+    while (MCLK == 1); //Ignore parity bit
+    while (MCLK == 0); //Ignore parity bit
+    while (MCLK == 1); //Ignore stop bit
+    while (MCLK == 0); //Ignore stop bit
+    golo(1); //Put hold on incoming data
+    return data; //Return byte of data received
+}
+
+void mouse_init() {
+    ANSELD = 0x00; //Set Port D as digital
+    gohi(1); //Set clock high
+    gohi(0); //Set data low
+    mouse_write(0xff); //Initialize mouse
+    mouse_read(); //Read ack
+    mouse_read(); //Read ack
+    mouse_read(); //Read ack
+    mouse_write(0xf0); //Set remote mode
+    mouse_read(); //Read ack
+    __delay_us(100); //Delay
+}
+
+void timer_init() {
+    T0CON0bits.T0EN = 1; //Enable Timer0
+    T0CON0bits.T016BIT = 1; //Set timer as 16 bit
+    T0CON1bits.T0CS = 0b010; //Use Fosc/4
+    T0CON1bits.T0CKPS = 0b0000; //Prescaler = 1:1
+    PIE0bits.TMR0IE = 1; //Enable Timer0 interrupts
+}
+
+void interrupt_init(void) {
+    INTCONbits.PEIE = 1; // Enable peripheral interrupts
+    INTCONbits.GIE = 1; // Enable global interrupts
+    INTCONbits.IPEN = 1; //Enable interrupt priority
+    IPR0bits.TMR0IP = 0; //Set timer interrupt as low priority
+    IPR0bits.IOCIP = 1; //Set IOC interrupt as high priority
+}
+
+int __interrupt() ISR(void) {
+    if (PIR0bits.TMR0IF == 1) { //Timer Interrupt
+        mouse_write(0xeb); //Request data
+        mouse_read(); //Read ack
+        mstat = mouse_read(); //Read button data
+        mx = mouse_read(); //Read X value
+        my = mouse_read(); //Read Y value
+        if (LOCKSTAT == 0) { //If trackball is enabled
+            if (mx <= 0x7F) { //If X is positive
+                xBuf = xBuf + (int) (mx); //Update X buffer
+            } else { //If X is negative
+                xBuf = xBuf - (int) (0xFF - mx) - 1; //Update X buffer
+            }
+            if (my <= 0x7F) { //If Y is positive
+                yBuf = yBuf + (int) (my); //Update Y buffer
+            } else { //If Y is negative
+                yBuf = yBuf - (int) (0xFF - my) - 1; //Update Y buffer
+            }
+        }
+        PIR0bits.TMR0IF = 0; //Clear Flag
+    }
+    if (IOCAFbits.IOCAF0 == 1) { //Pause/Play button Interrupt
+        if (IOCAPbits.IOCAP0 == 1) { //If positive trigger
+            USART1_TransmitString("PLAY"); //Send command to Bluetooth
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA0 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN0 == 0) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF0 = 0; //Clear flag
+    }
+    if (IOCAFbits.IOCAF1 == 1) { //FF button Interrupt
+        if (IOCAPbits.IOCAP1 == 1) { //If positive trigger
+            USART1_TransmitString("FFWD"); //Send command to Bluetooth
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA1 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN1 == 1) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF1 = 0; //Clear flag
+    }
+    if (IOCAFbits.IOCAF2 == 1) { //RW button Interrupt
+        if (IOCAPbits.IOCAP2 == 1) { //If positive trigger
+            USART1_TransmitString("RWND"); //Send command to Bluetooth
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA2 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN2 == 1) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF2 = 0; //Clear flag
+    }
+    if (IOCAFbits.IOCAF3 == 1) { //Zoom in button Interrupt
+        if (IOCAPbits.IOCAP3 == 1) { //If positive trigger
+            USART1_TransmitString("ZMIN"); //Send command to Bluetooth
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA3 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN3 == 1) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF3 = 0; //Clear flag
+    }
+    if (IOCAFbits.IOCAF4 == 1) { //Zoom out button Interrupt
+        if (IOCAPbits.IOCAP4 == 1) { //If positive trigger
+            USART1_TransmitString("ZMOT"); //Send command to Bluetooth
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA4 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN4 == 1) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF4 = 0; //Clear flag
+    }
+    if (IOCAFbits.IOCAF5 == 1) { //Lock button Interrupt
+        if (IOCAPbits.IOCAP5 == 1) { //If positive trigger
+            if (LOCKSTAT == 0) { //If trackball is enabled
+                LOCKSTAT = 1; //Disable trackball and turn on LED
+                PIE0bits.TMR0IE = 0; //Disable Timer0 interrupts
+            } else if (LOCKSTAT == 1) { //If trackball is disabled
+                LOCKSTAT = 0; //Enable trackball and turn off LED
+                PIE0bits.TMR0IE = 1; //Enable Timer0 interrupts
+            }
+            __delay_ms(50); //Debounce
+            while (PORTAbits.RA5 == 1); //Debounce
+        }
+        if (IOCANbits.IOCAN5 == 1) { //If negative trigger
+            __delay_ms(50); //Debounce
+        }
+        IOCAFbits.IOCAF5 = 0; //Clear flag
+    }
+}
+
+void main(void) {
+    OSC_init(); //Initialize oscillator
+    button_init(); //Initialize buttons
+    mouse_init(); //Initialize trackball
+    USART1_init(); //Initialize USART
+    timer_init(); //Initialize timer
+    interrupt_init(); //Initialize interrupts
+
+    int bufMax = 20; //Buffer value at which trackball movement is sent
+
+    while (1) { //Infinite loop
+        if (xBuf > bufMax) { //If X buffer reaches max
+            xBuf = xBuf - bufMax; //Reset X buffer
+            USART1_TransmitString("MVRT"); //Send command to Bluetooth
+        }
+        if (xBuf < -1 * bufMax) { //If X buffer reaches min
+            xBuf = xBuf + bufMax; //Reset X buffer
+            USART1_TransmitString("MVLF"); //Send command to Bluetooth
+        }
+        if (yBuf > bufMax) { //If Y buffer reaches max
+            yBuf = yBuf - bufMax; //Reset Y buffer
+            USART1_TransmitString("MVUP"); //Send command to Bluetooth
+        }
+        if (yBuf < -1 * bufMax) { //If Y buffer reaches min
+            yBuf = yBuf + bufMax; //Reset Y buffer
+            USART1_TransmitString("MVDN"); //Send command to Bluetooth
+        }
+    }
+}
